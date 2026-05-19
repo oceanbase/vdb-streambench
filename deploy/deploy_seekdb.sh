@@ -32,9 +32,11 @@ else
     done
 fi
 
-echo "Creating test database..."
+echo "Creating test database and bench user..."
 mysql -h 127.0.0.1 -P 2881 -u root -e "CREATE DATABASE IF NOT EXISTS test;" 2>/dev/null || true
+mysql -h 127.0.0.1 -P 2881 -u root -e "CREATE USER IF NOT EXISTS 'bench'@'%' IDENTIFIED BY 'bench123';" 2>/dev/null || true
+mysql -h 127.0.0.1 -P 2881 -u root -e "GRANT ALL PRIVILEGES ON *.* TO 'bench'@'%';" 2>/dev/null || true
 
 echo "Verifying..."
-mysql -h 127.0.0.1 -P 2881 -u root -e "SHOW DATABASES;"
+mysql -h 127.0.0.1 -P 2881 -u bench -pbench123 -e "SHOW DATABASES;"
 echo "=== SeekDB ready on port 2881 ==="

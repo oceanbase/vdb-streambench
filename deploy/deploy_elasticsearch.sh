@@ -36,13 +36,23 @@ grep -q "vm.max_map_count=262144" /etc/sysctl.conf 2>/dev/null || {
     sysctl -p
 }
 
-sed -i 's/^xpack.security.enabled:.*/xpack.security.enabled: false/' "${ES_HOME}/config/elasticsearch.yml" 2>/dev/null || \
-    echo "xpack.security.enabled: false" >> "${ES_HOME}/config/elasticsearch.yml"
-
+# ES 9.x auto-generates a security config block (TLS + enrollment) on first
+# start, which overrides a simple sed patch.  Write the full config up front
+# so the auto-generation never kicks in.
+cat > "${ES_HOME}/config/elasticsearch.yml" <<'ESYML'
+xpack.security.enabled: false
+xpack.security.enrollment.enabled: false
+xpack.security.http.ssl.enabled: false
+xpack.security.transport.ssl.enabled: false
+http.host: 0.0.0.0
+discovery.type: single-node
+ESYML
 cat > "${ES_HOME}/config/jvm.options.d/heap.options" <<'JVMEOF'
 -Xms30g
 -Xmx30g
 JVMEOF
+
+chown -R elasticsearch:elasticsearch "${ES_HOME}"
 
 cat > /etc/systemd/system/elasticsearch.service <<'EOF'
 [Unit]

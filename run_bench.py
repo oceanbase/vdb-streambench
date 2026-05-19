@@ -50,14 +50,78 @@ DATASET_MAP = {
 
 ALL_DBS = ["seekdb", "elasticsearch", "milvus", "chroma", "qdrant", "lancedb"]
 
+DEPLOY_DIR = Path(__file__).resolve().parent / "deploy"
+
+HEALTH_CHECKS = {
+    "milvus": "curl -sf http://localhost:19530/v1/vector/collections -o /dev/null",
+    "elasticsearch": "curl -sf http://localhost:9200 -o /dev/null",
+    "qdrant": "curl -sf http://localhost:6333/readyz -o /dev/null",
+    "chroma": "curl -sf http://localhost:8000/api/v2/heartbeat -o /dev/null",
+    "seekdb": "mysql -h 127.0.0.1 -P 2881 -u bench -pbench123 -e 'SELECT 1' >/dev/null 2>&1",
+    "lancedb": None,
+}
+
+DEPLOY_SCRIPTS = {
+    "milvus": "deploy_milvus.sh",
+    "elasticsearch": "deploy_elasticsearch.sh",
+    "qdrant": "deploy_qdrant.sh",
+    "chroma": "deploy_chroma.sh",
+    "seekdb": "deploy_seekdb.sh",
+    "lancedb": None,
+}
+
 STOP_COMMANDS = {
     "milvus": "systemctl stop milvus",
     "elasticsearch": "systemctl stop elasticsearch",
     "qdrant": "systemctl stop qdrant",
-    "chroma": "pkill -f 'chroma run'",
+    "chroma": "pkill -f 'start_chroma.py'",
     "seekdb": "docker stop seekdb",
     "lancedb": None,
 }
+
+
+def is_db_ready(name: str) -> bool:
+    cmd = HEALTH_CHECKS.get(name)
+    if cmd is None:
+        return True
+    try:
+        r = subprocess.run(cmd, shell=True, timeout=10, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def ensure_db_running(name: str):
+    """Check if DB is healthy; if not, run its deploy script."""
+    if is_db_ready(name):
+        print(f"  {name} is already running")
+        return
+
+    script = DEPLOY_SCRIPTS.get(name)
+    if script is None:
+        return
+
+    script_path = DEPLOY_DIR / script
+    if not script_path.exists():
+        print(f"  Error: deploy script not found: {script_path}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"  {name} not running, deploying via {script}...")
+    r = subprocess.run(
+        ["bash", str(script_path)],
+        timeout=600,
+        check=False,
+    )
+    if r.returncode != 0:
+        print(f"  Error: deploy script failed for {name} (exit {r.returncode})", file=sys.stderr)
+        sys.exit(1)
+
+    if not is_db_ready(name):
+        print(f"  Error: {name} still not healthy after deploy", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"  {name} deployed and ready")
 
 
 def stop_db(name: str):
@@ -122,8 +186,8 @@ def build_db_config(name: str):
             SeekDBConfig(
                 host=os.getenv("SEEKDB_HOST", "127.0.0.1"),
                 port=int(os.getenv("SEEKDB_PORT", "2881")),
-                user=os.getenv("SEEKDB_USER", "root"),
-                password=os.getenv("SEEKDB_PASSWORD", "unused"),
+                user=os.getenv("SEEKDB_USER", "bench"),
+                password=os.getenv("SEEKDB_PASSWORD", "bench123"),
                 database=os.getenv("SEEKDB_DATABASE", "test"),
             ),
             SeekDBHNSWConfig(m=16, ef_construction=256, ef_search=200),
@@ -151,10 +215,21 @@ def download_dataset(dataset_enum):
     return False
 
 
-def build_task(db_name, dataset_enum):
+# LanceDB serial search is slow (~26s at 50%, ~36s at 80%), which eats into the
+# inter-stage time budget. At the default rate=500, get_each_conc_search_dur()
+# returns <10s for the 80% stage, causing VectorDBBench to skip concurrent search
+# entirely. Lowering insert_rate to 200 stretches the insertion window, giving
+# enough headroom for concurrent search to run at every stage.
+INSERT_RATE_OVERRIDES = {
+    ("lancedb", "CohereSmall"): 200,
+}
+
+
+def build_task(db_name, dataset_enum, dataset_name):
+    rate = INSERT_RATE_OVERRIDES.get((db_name, dataset_name), 500)
     custom_case = {
         "dataset_with_size_type": dataset_enum.value,
-        "insert_rate": 500,
+        "insert_rate": rate,
         "search_stages": [0.5, 0.8],
         "concurrencies": [5, 10],
         "read_dur_after_write": 30,
@@ -172,10 +247,12 @@ def build_task(db_name, dataset_enum):
     )
 
 
-def run_single_db(db_name, dataset_enum, task_label):
-    """Run benchmark for a single DB, then stop the DB service."""
-    print(f"\n--- Benchmarking {db_name} ---")
-    task = build_task(db_name, dataset_enum)
+def run_single_db(db_name, dataset_enum, dataset_name, task_label):
+    """Ensure DB is deployed, run benchmark, then stop the DB service."""
+    rate = INSERT_RATE_OVERRIDES.get((db_name, dataset_name), 500)
+    print(f"\n--- Benchmarking {db_name} (insert_rate={rate}) ---")
+    ensure_db_running(db_name)
+    task = build_task(db_name, dataset_enum, dataset_name)
     label = f"{task_label}_{db_name}"
 
     if not benchmark_runner.run([task], task_label=label):
@@ -191,9 +268,32 @@ def run_single_db(db_name, dataset_enum, task_label):
     return label
 
 
-def extract_80_metrics(metric):
-    """Extract 80% stage metrics from a Metric object."""
-    stages = getattr(metric, "st_search_stage_list", None) or []
+def collect_results_from_json(task_labels):
+    """Read result JSON files directly (bypasses VectorDBBench's buggy deserializer)."""
+    import json
+    from vectordb_bench import config as vdb_config
+
+    results_dir = Path(vdb_config.RESULTS_LOCAL_DIR)
+    collected = []
+    for label in task_labels:
+        for json_file in results_dir.rglob("*.json"):
+            if label not in json_file.name:
+                continue
+            try:
+                with open(json_file) as f:
+                    data = json.load(f)
+                for r in data.get("results", []):
+                    db_name = r["task_config"]["db"]
+                    metrics = r["metrics"]
+                    collected.append((db_name, metrics))
+            except Exception as e:
+                print(f"  Warning: failed to read {json_file}: {e}")
+    return collected
+
+
+def extract_80_metrics(m):
+    """Extract 80% stage metrics from a metrics dict."""
+    stages = m.get("st_search_stage_list", [])
 
     idx = None
     for i, s in enumerate(stages):
@@ -210,11 +310,11 @@ def extract_80_metrics(metric):
             return None
 
     return {
-        "recall": safe_get(metric.st_recall_list, idx),
-        "serial_p99": safe_get(metric.st_serial_latency_p99_list, idx),
-        "conc_qps": safe_get(metric.st_conc_qps_list_list, idx),
-        "conc_p99": safe_get(metric.st_conc_latency_p99_list_list, idx),
-        "conc_nums": safe_get(metric.st_conc_num_list_list, idx),
+        "recall": safe_get(m.get("st_recall_list"), idx),
+        "serial_p99": safe_get(m.get("st_serial_latency_p99_list"), idx),
+        "conc_qps": safe_get(m.get("st_conc_qps_list_list"), idx),
+        "conc_p99": safe_get(m.get("st_conc_latency_p99_list_list"), idx),
+        "conc_nums": safe_get(m.get("st_conc_num_list_list"), idx),
     }
 
 
@@ -224,7 +324,7 @@ def fmt_conc(values, nums):
     return " / ".join(f"c{n}:{v:.2f}" for n, v in zip(nums, values))
 
 
-def print_summary(results, task_labels, run_label):
+def print_summary(result_pairs, run_label):
     headers = [
         "Database",
         "Conc QPS (80%)",
@@ -234,25 +334,21 @@ def print_summary(results, task_labels, run_label):
     ]
     rows = []
 
-    for tr in results:
-        if tr.task_label not in task_labels:
+    for db_name, metrics in result_pairs:
+        m = extract_80_metrics(metrics)
+        if m is None:
+            rows.append([db_name, "N/A", "N/A", "N/A", "N/A"])
             continue
-        for cr in tr.results:
-            db_name = cr.task_config.db.value
-            m = extract_80_metrics(cr.metrics)
-            if m is None:
-                rows.append([db_name, "N/A", "N/A", "N/A", "N/A"])
-                continue
-            rows.append([
-                db_name,
-                fmt_conc(m["conc_qps"], m["conc_nums"]),
-                f"{m['serial_p99'] * 1000:.2f}" if m["serial_p99"] else "N/A",
-                fmt_conc(
-                    [v * 1000 for v in m["conc_p99"]] if m["conc_p99"] else None,
-                    m["conc_nums"],
-                ),
-                f"{m['recall']:.4f}" if m["recall"] else "N/A",
-            ])
+        rows.append([
+            db_name,
+            fmt_conc(m["conc_qps"], m["conc_nums"]),
+            f"{m['serial_p99'] * 1000:.2f}" if m["serial_p99"] else "N/A",
+            fmt_conc(
+                [v * 1000 for v in m["conc_p99"]] if m["conc_p99"] else None,
+                m["conc_nums"],
+            ),
+            f"{m['recall']:.4f}" if m["recall"] else "N/A",
+        ])
 
     print("\n=== Streaming Benchmark Results (80% stage) ===\n")
     print(tabulate(rows, headers=headers, tablefmt="pipe"))
@@ -299,16 +395,16 @@ def main():
     task_labels = []
     for i, db_name in enumerate(args.databases, 1):
         print(f"\n[{i}/{len(args.databases)}] {db_name}")
-        label = run_single_db(db_name, dataset_enum, run_label)
+        label = run_single_db(db_name, dataset_enum, args.dataset, run_label)
         task_labels.append(label)
 
     print("\n[3/3] Collecting results...")
-    results = benchmark_runner.get_results()
-    if not results:
+    result_pairs = collect_results_from_json(task_labels)
+    if not result_pairs:
         print("No results found.", file=sys.stderr)
         sys.exit(1)
 
-    print_summary(results, set(task_labels), run_label)
+    print_summary(result_pairs, run_label)
 
 
 if __name__ == "__main__":
