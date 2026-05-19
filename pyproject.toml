@@ -1,0 +1,10 @@
+[project]
+name = "vdb-streaming-bench"
+version = "0.1.0"
+description = "Benchmark vector databases with VectorDBBench StreamingPerformanceCase"
+requires-python = ">=3.11"
+dependencies = [
+    "vectordb-bench[qdrant,elastic,chromadb,lancedb,seekdb]",
+    "python-dotenv",
+    "tabulate",
+]
