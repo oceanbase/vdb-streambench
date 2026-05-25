@@ -1,194 +1,71 @@
 # VDB StreamBench
 
-This project runs reproducible streaming-ingestion benchmarks across multiple
-vector databases using VectorDBBench's `StreamingPerformanceCase`.
+Reproducible streaming-ingestion benchmarks across multiple vector databases,
+built on VectorDBBench's `StreamingPerformanceCase`.
 
-The benchmark focuses on a common production pattern: vectors are inserted over
-time while the system is also serving searches. Instead of measuring only a
-fully-loaded, read-only index, the script evaluates how each database behaves
-while data is still being written.
-
-## Background
-
-Vector databases often look different under streaming workloads than under
-offline bulk-load workloads. During continuous ingestion, a database must balance
-index construction, write throughput, search latency, recall, memory use, and
-background compaction or persistence work.
-
-This repository wraps VectorDBBench with a simple runner that:
-
-- Downloads the selected VectorDBBench dataset before the run.
-- Deploys and health-checks each selected database.
-- Runs one database at a time to reduce resource interference.
-- Stops each database after its benchmark finishes.
-- Collects result JSON files and prints a compact comparison table.
-- Saves a CSV summary under `/tmp/vectordb_bench_results`.
-
-The current benchmark uses HNSW-style index parameters across supported
-databases where possible:
-
-- `M = 16`
-- `ef_construction = 256`
-- `ef_search = 200`
-
-The default streaming case uses:
-
-- `insert_rate = 500`
-- `search_stages = [0.5, 0.8]`
-- `concurrencies = [5, 10]`
-- `read_dur_after_write = 30`
+The benchmark evaluates how each database performs while data is continuously
+being inserted — balancing index construction, write throughput, search latency,
+recall, and memory usage under a realistic production pattern.
 
 ## Supported Databases
 
-The runner currently supports:
+| Database | Deploy | Health Check | Notes |
+|---|---|---|---|
+| SeekDB | `deploy_seekdb.sh` | `mysql ... SELECT 1` | Docker-based |
+| Elasticsearch | `deploy_elasticsearch.sh` | `curl :9200` | systemd service |
+| Milvus | `deploy_milvus.sh` | `curl :19530` | systemd service |
+| Chroma | `deploy_chroma.sh` | `curl :8000` | Python process |
+| Qdrant | `deploy_qdrant.sh` | `curl :6333` | systemd service |
+| LanceDB | N/A | N/A | Embedded, no external service |
 
-- SeekDB
-- Elasticsearch
-- Milvus
-- Chroma
-- Qdrant
-- LanceDB
-
-Deployment helpers live in `deploy/`. The runner checks whether a database is
-already healthy before starting it. If the database is not healthy and a deploy
-script exists, the runner executes the matching deploy script automatically.
-
-LanceDB is embedded and does not require an external service.
-
-## Requirements
-
-Use Linux for full benchmark execution. The deployment scripts assume common
-Linux tools and services such as `systemctl`, `curl`, `wget`, `tar`, `yum`, and
-`mysql`.
-
-Python requirements:
-
-- Python 3.11 or newer
-- A virtual environment
-- Project dependencies installed from `pyproject.toml`
-
-System requirements:
-
-- Sufficient memory for database services. Elasticsearch is configured with a
-  30 GB heap in `deploy/deploy_elasticsearch.sh`.
-- Sufficient disk space for datasets, database data, and result files.
-- Container support for SeekDB. The script uses the `docker` command. On some
-  Alibaba Cloud Linux images, `docker` may be provided by `podman-docker`, which
-  is also acceptable for the current deployment script.
-- Network access for downloading Python packages, benchmark datasets, and
-  database binaries or images.
-
-## Installation
-
-Clone or copy the project to the target Linux machine, then create a Python 3.11
-virtual environment from the project root:
+## Quick Start
 
 ```bash
-cd /root/vdb-bench
-
 python3.11 -m venv .venv
 source .venv/bin/activate
+pip install -U pip && pip install -e .
 
-python -m pip install -U pip
-python -m pip install -e .
-```
-
-Do not use the system Python if it is older than Python 3.11. For example, some
-Linux distributions still provide Python 3.6 as `/usr/bin/python`.
-
-## Dependency Notes
-
-This project pins a compatible OpenTelemetry/protobuf dependency set for Chroma,
-Milvus, and the current VectorDBBench dependency graph.
-
-The important compatibility constraints are:
-
-- `protobuf>=5.27.2,<7`
-- `opentelemetry-api==1.41.1`
-- `opentelemetry-sdk==1.41.1`
-- `opentelemetry-proto==1.41.1`
-- `opentelemetry-exporter-otlp-proto-grpc==1.41.1`
-
-Chroma also requires SQLite 3.35 or newer. Many enterprise Linux systems ship an
-older system SQLite. The project depends on `pysqlite3-binary`, and
-`run_bench.py` swaps it in before importing Chroma-related modules.
-
-## Usage
-
-Run all supported databases on the default dataset:
-
-```bash
-cd /root/vdb-bench
-source .venv/bin/activate
-
+# Run all databases on CohereSmall (default)
 python run_bench.py
+
+# Run specific databases on a larger dataset
+python run_bench.py -d seekdb milvus qdrant --dataset CohereLarge
 ```
 
-Run all supported databases on the medium Cohere dataset:
+## Deployment Modes
 
-```bash
-python run_bench.py \
-  -d seekdb elasticsearch milvus chroma qdrant lancedb \
-  --dataset CohereMedium
-```
+The runner automatically detects whether each database is local or remote based
+on its configured host address.
 
-Run only one database:
+### Local (default)
 
-```bash
-python run_bench.py -d qdrant --dataset CohereSmall
-```
+When the host resolves to `localhost` / `127.0.0.1` / `::1`:
 
-Run a subset of databases:
+1. Health-check the database.
+2. If not healthy, run the deploy script locally.
+3. After benchmark, stop the database service locally.
 
-```bash
-python run_bench.py -d milvus qdrant lancedb --dataset CohereMedium
-```
+### Remote (split client/server)
 
-Show command-line help:
+When the host points to a remote address (e.g., `SEEKDB_HOST=172.16.0.200`):
 
-```bash
-python run_bench.py --help
-```
+1. Health-check the database from the client machine.
+2. If not healthy, deploy via SSH (`ssh {SSH_USER}@{host} bash -s < script`).
+3. After benchmark, stop the database via SSH.
 
-## Datasets
-
-Supported dataset names:
-
-- `CohereSmall`
-- `CohereMedium`
-- `CohereLarge`
-
-The runner first attempts to prepare the dataset from S3, then falls back to
-Aliyun OSS if the S3 download fails.
-
-## Runtime Behavior
-
-The benchmark flow is:
-
-1. Load environment variables from `.env` if present.
-2. Download or prepare the selected dataset.
-3. For each selected database:
-   - Check whether the database is already healthy.
-   - Deploy it if needed.
-   - Build the VectorDBBench task config.
-   - Run the streaming performance benchmark.
-   - Wait until the benchmark finishes.
-   - Stop the database service or container.
-4. Read VectorDBBench result JSON files.
-5. Print an 80% stage comparison table.
-6. Save a CSV summary.
-
-Each database is benchmarked sequentially so that one database does not consume
-CPU, memory, or IO during another database's run.
+Requirements for remote mode:
+- SSH key authentication set up between client and server.
+- The client machine must be able to reach the database port directly (for
+  health checks and benchmark connections).
+- `SSH_USER` env var (default: `root`).
 
 ## Configuration
 
-Most defaults are defined in `run_bench.py`. You can override service addresses
-with environment variables or a `.env` file.
-
-Supported environment variables include:
+Service addresses are configured via environment variables or a `.env` file.
+The runner calls `load_dotenv()` at startup.
 
 ```bash
+# .env example
 MILVUS_URI=http://localhost:19530
 
 ES_HOST=localhost
@@ -207,146 +84,86 @@ SEEKDB_PORT=2881
 SEEKDB_USER=bench
 SEEKDB_PASSWORD=bench123
 SEEKDB_DATABASE=test
+
+# SSH user for remote deploy/stop (default: root)
+SSH_USER=root
 ```
+
+## Datasets
+
+| Name | Vectors | Dimensions |
+|---|---|---|
+| `CohereSmall` | 1M | 768 |
+| `CohereMedium` | 5M | 768 |
+| `CohereLarge` | 10M | 768 |
+
+The runner downloads datasets from S3, falling back to Aliyun OSS on failure.
+
+## Benchmark Parameters
+
+All databases use unified HNSW index parameters:
+
+| Parameter | Value |
+|---|---|
+| `M` | 16 |
+| `ef_construction` | 256 |
+| `ef_search` | 200 |
+
+Streaming case defaults:
+
+| Parameter | Value |
+|---|---|
+| `insert_rate` | 500 rows/s |
+| `search_stages` | 50%, 80% |
+| `concurrencies` | 5, 10 |
+| `read_dur_after_write` | 30s |
+
+## CohereLarge Memory Tuning
+
+CohereLarge (10M x 768dim) is memory-intensive. On a 61 GB server the HNSW
+index alone grows to ~37 GB at full scale. The runner automatically applies the
+following when running SeekDB + CohereLarge:
+
+1. **THP check** -- verifies Transparent Huge Pages is disabled on the server.
+   THP causes ~7 GB+ untracked memory fragmentation leading to OOM. The runner
+   exits with a detailed error if THP is still enabled:
+
+   ```bash
+   echo never > /sys/kernel/mm/transparent_hugepage/enabled
+   echo never > /sys/kernel/mm/transparent_hugepage/defrag
+   ```
+
+2. **Memory parameters** -- raises limits to fully utilize the server:
+   - `memory_limit_percentage = 90`
+   - `ob_vector_memory_limit_percentage = 80`
+
+Smaller datasets (CohereSmall/CohereMedium) stay within default limits and
+don't need these adjustments.
 
 ## Results
 
-The script prints a table similar to:
+The runner prints a comparison table at 80% stage and saves a CSV:
 
-```text
-=== Streaming Benchmark Results (80% stage) ===
+```
+/tmp/vectordb_bench_results/summary_streaming_YYYYMMDD_HHMMSS.csv
 ```
 
-The summary includes:
+Metrics reported: Concurrent QPS, Serial P99, Concurrent P99, Recall.
 
-- Concurrent QPS at the 80% stage.
-- Serial P99 latency at the 80% stage.
-- Concurrent P99 latency at the 80% stage.
-- Recall at the 80% stage.
-
-CSV summaries are written to:
-
-```text
-/tmp/vectordb_bench_results
-```
-
-The filename format is:
-
-```text
-summary_streaming_YYYYMMDD_HHMMSS.csv
-```
-
-VectorDBBench also writes its raw result files under its configured local results
-directory. `run_bench.py` reads those JSON files directly when building the final
-summary.
-
-## Deployment Helpers
-
-The deployment scripts are:
-
-- `deploy/deploy_seekdb.sh`
-- `deploy/deploy_elasticsearch.sh`
-- `deploy/deploy_milvus.sh`
-- `deploy/deploy_chroma.sh`
-- `deploy/deploy_qdrant.sh`
-
-The runner maps databases to these scripts automatically. You can also execute a
-deployment script manually when debugging a single service:
+## Running in Background
 
 ```bash
-bash deploy/deploy_qdrant.sh
-```
-
-## Troubleshooting
-
-### `ModuleNotFoundError: No module named 'dotenv'`
-
-Install the project dependencies inside the virtual environment:
-
-```bash
-source .venv/bin/activate
-python -m pip install -e .
-```
-
-### `Descriptors cannot be created directly`
-
-This usually means an incompatible `protobuf` and OpenTelemetry proto package
-combination is installed. Reinstall the project dependencies after pulling the
-latest `pyproject.toml`:
-
-```bash
-source .venv/bin/activate
-python -m pip install -U -e .
-```
-
-You can verify the relevant versions with:
-
-```bash
-python -m pip show protobuf opentelemetry-proto opentelemetry-exporter-otlp-proto-grpc
-```
-
-### `Chroma requires sqlite3 >= 3.35.0`
-
-Install dependencies from this project so that `pysqlite3-binary` is available:
-
-```bash
-source .venv/bin/activate
-python -m pip install -e .
-```
-
-`run_bench.py` imports `pysqlite3` before importing Chroma and replaces the
-standard `sqlite3` module for the current process.
-
-### `docker.service not found`
-
-Some machines provide the `docker` command through `podman-docker` instead of a
-Docker daemon managed by `docker.service`. Check the runtime with:
-
-```bash
-docker info
-```
-
-The SeekDB deploy script only needs the `docker` command to support container
-operations such as `docker run`, `docker ps`, `docker rm`, and `docker stop`.
-
-### Database Health Checks Fail
-
-Check the service manually:
-
-```bash
-curl http://localhost:9200
-curl http://localhost:6333/readyz
-curl http://localhost:8000/api/v2/heartbeat
-curl http://localhost:19530/v1/vector/collections
-mysql -h 127.0.0.1 -P 2881 -u bench -pbench123 -e "SELECT 1"
-```
-
-Then inspect the corresponding service logs or deployment logs.
-
-## Running in the Background
-
-Longer datasets can take a while. To keep the benchmark running after the SSH
-session exits:
-
-```bash
-cd /root/vdb-bench
-source .venv/bin/activate
-
 nohup python run_bench.py \
-  -d seekdb elasticsearch milvus chroma qdrant lancedb \
-  --dataset CohereMedium \
-  > bench_CohereMedium.log 2>&1 &
-```
+  -d seekdb milvus qdrant \
+  --dataset CohereLarge \
+  > /tmp/bench_coherelarge.log 2>&1 &
 
-Follow the log:
-
-```bash
-tail -f bench_CohereMedium.log
+tail -f /tmp/bench_coherelarge.log
 ```
 
 ## Project Layout
 
-```text
+```
 .
 ├── deploy/
 │   ├── deploy_chroma.sh
@@ -360,13 +177,46 @@ tail -f bench_CohereMedium.log
 └── run_bench.py
 ```
 
-## Notes for Benchmark Interpretation
+## Requirements
 
-Benchmark results are sensitive to hardware, kernel settings, filesystem
-performance, memory pressure, service versions, and dataset download location.
-For fair comparisons, run all databases on the same machine with the same
-dataset and avoid other heavy workloads during the benchmark.
+- Python >= 3.11
+- Linux (deploy scripts use `systemctl`, `curl`, `docker`, etc.)
+- `mysql` client (for SeekDB health checks)
+- Sufficient memory for database services and dataset
+- Network access for downloading datasets and database binaries
 
-Because the runner starts and stops services sequentially, results are intended
-to compare each database under similar machine-level conditions rather than under
-multi-database contention.
+## Dependency Notes
+
+Pinned OpenTelemetry/protobuf versions for Chroma + Milvus compatibility:
+
+```
+protobuf>=5.27.2,<7
+opentelemetry-api==1.41.1
+opentelemetry-sdk==1.41.1
+opentelemetry-proto==1.41.1
+opentelemetry-exporter-otlp-proto-grpc==1.41.1
+```
+
+Chroma requires SQLite >= 3.35. The project includes `pysqlite3-binary` and
+swaps it in at startup for systems with older SQLite.
+
+## Troubleshooting
+
+**`ModuleNotFoundError: No module named 'dotenv'`** -- Install project
+dependencies: `pip install -e .`
+
+**`Descriptors cannot be created directly`** -- Reinstall to fix
+protobuf/OpenTelemetry mismatch: `pip install -U -e .`
+
+**`Chroma requires sqlite3 >= 3.35.0`** -- Ensure `pysqlite3-binary` is
+installed via `pip install -e .`
+
+**Health check fails** -- Verify the service manually:
+
+```bash
+curl http://localhost:9200                          # Elasticsearch
+curl http://localhost:6333/readyz                    # Qdrant
+curl http://localhost:8000/api/v2/heartbeat          # Chroma
+curl http://localhost:19530/v1/vector/collections    # Milvus
+mysql -h 127.0.0.1 -P 2881 -u bench -pbench123 -e "SELECT 1"  # SeekDB
+```

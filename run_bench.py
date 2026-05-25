@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Fix sqlite3 for ChromaDB on systems with old SQLite (<3.35)
 try:
@@ -52,15 +53,6 @@ ALL_DBS = ["seekdb", "elasticsearch", "milvus", "chroma", "qdrant", "lancedb"]
 
 DEPLOY_DIR = Path(__file__).resolve().parent / "deploy"
 
-HEALTH_CHECKS = {
-    "milvus": "curl -sf http://localhost:19530/v1/vector/collections -o /dev/null",
-    "elasticsearch": "curl -sf http://localhost:9200 -o /dev/null",
-    "qdrant": "curl -sf http://localhost:6333/readyz -o /dev/null",
-    "chroma": "curl -sf http://localhost:8000/api/v2/heartbeat -o /dev/null",
-    "seekdb": "mysql -h 127.0.0.1 -P 2881 -u bench -pbench123 -e 'SELECT 1' >/dev/null 2>&1",
-    "lancedb": None,
-}
-
 DEPLOY_SCRIPTS = {
     "milvus": "deploy_milvus.sh",
     "elasticsearch": "deploy_elasticsearch.sh",
@@ -80,8 +72,73 @@ STOP_COMMANDS = {
 }
 
 
+def _db_host(name: str) -> str:
+    if name == "milvus":
+        return urlparse(os.getenv("MILVUS_URI", "http://localhost:19530")).hostname or "localhost"
+    if name == "elasticsearch":
+        return os.getenv("ES_HOST", "localhost")
+    if name == "qdrant":
+        return urlparse(os.getenv("QDRANT_URL", "http://localhost:6333")).hostname or "localhost"
+    if name == "chroma":
+        return os.getenv("CHROMA_HOST", "localhost")
+    if name == "seekdb":
+        return os.getenv("SEEKDB_HOST", "127.0.0.1")
+    return "localhost"
+
+
+def _is_local_db(name: str) -> bool:
+    return _db_host(name) in ("localhost", "127.0.0.1", "::1")
+
+
+def _ssh_target(name: str) -> str:
+    user = os.getenv("SSH_USER", "root")
+    return f"{user}@{_db_host(name)}"
+
+
+def _run_remote(name: str, cmd: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["ssh", _ssh_target(name), cmd],
+        timeout=timeout, check=False,
+    )
+
+
+def _run_remote_script(name: str, script_path: Path, timeout: int = 600) -> subprocess.CompletedProcess:
+    with open(script_path) as f:
+        return subprocess.run(
+            ["ssh", _ssh_target(name), "bash -s"],
+            stdin=f, timeout=timeout, check=False,
+        )
+
+
+def _health_cmd(name: str) -> str | None:
+    if name == "milvus":
+        uri = os.getenv("MILVUS_URI", "http://localhost:19530")
+        return f"curl -sf {uri}/v1/vector/collections -o /dev/null"
+    if name == "elasticsearch":
+        host = os.getenv("ES_HOST", "localhost")
+        port = os.getenv("ES_PORT", "9200")
+        return f"curl -sf http://{host}:{port} -o /dev/null"
+    if name == "qdrant":
+        url = os.getenv("QDRANT_URL", "http://localhost:6333")
+        return f"curl -sf {url}/readyz -o /dev/null"
+    if name == "chroma":
+        host = os.getenv("CHROMA_HOST", "localhost")
+        port = os.getenv("CHROMA_PORT", "8000")
+        return f"curl -sf http://{host}:{port}/api/v2/heartbeat -o /dev/null"
+    if name == "seekdb":
+        host = os.getenv("SEEKDB_HOST", "127.0.0.1")
+        port = os.getenv("SEEKDB_PORT", "2881")
+        user = os.getenv("SEEKDB_USER", "bench")
+        password = os.getenv("SEEKDB_PASSWORD", "bench123")
+        pass_opt = f" -p{password}" if password else ""
+        return f'mysql -h {host} -P {port} -u {user}{pass_opt} -e "SELECT 1" >/dev/null 2>&1'
+    if name == "lancedb":
+        return None
+    return None
+
+
 def is_db_ready(name: str) -> bool:
-    cmd = HEALTH_CHECKS.get(name)
+    cmd = _health_cmd(name)
     if cmd is None:
         return True
     try:
@@ -92,8 +149,61 @@ def is_db_ready(name: str) -> bool:
         return False
 
 
+def check_thp_disabled():
+    """Check that Transparent Huge Pages is disabled on the SeekDB server."""
+    thp_cmd = "cat /sys/kernel/mm/transparent_hugepage/enabled"
+    if _is_local_db("seekdb"):
+        r = subprocess.run(thp_cmd, shell=True, timeout=10, check=False,
+                           capture_output=True, text=True)
+    else:
+        r = subprocess.run(
+            ["ssh", _ssh_target("seekdb"), thp_cmd],
+            timeout=10, check=False, capture_output=True, text=True,
+        )
+    if r.returncode != 0:
+        print(f"  Warning: failed to check THP status (exit {r.returncode})")
+        return
+    thp_status = r.stdout.strip()
+    if "[never]" in thp_status:
+        print(f"  THP is disabled: {thp_status}")
+        return
+    host = _db_host("seekdb")
+    print(f"\n  ERROR: Transparent Huge Pages (THP) is enabled on SeekDB server ({host})", file=sys.stderr)
+    print(f"  Current status: {thp_status}", file=sys.stderr)
+    print(f"  THP causes severe memory fragmentation for SeekDB CohereLarge workload,", file=sys.stderr)
+    print(f"  leading to ~7GB+ untracked memory and OOM during benchmark.", file=sys.stderr)
+    print(f"  Please disable THP on the server before running:", file=sys.stderr)
+    print(f"    echo never > /sys/kernel/mm/transparent_hugepage/enabled", file=sys.stderr)
+    print(f"    echo never > /sys/kernel/mm/transparent_hugepage/defrag", file=sys.stderr)
+    sys.exit(1)
+
+
+def seekdb_pre_benchmark():
+    """Set SeekDB system parameters before benchmark."""
+    host = os.getenv("SEEKDB_HOST", "127.0.0.1")
+    port = os.getenv("SEEKDB_PORT", "2881")
+    user = os.getenv("SEEKDB_USER", "root")
+    password = os.getenv("SEEKDB_PASSWORD", "")
+    pass_opt = f"-p{password}" if password else ""
+    vars_to_set = [
+        ("memory_limit_percentage", "90"),
+        ("ob_vector_memory_limit_percentage", "80"),
+    ]
+    for var, val in vars_to_set:
+        cmd = f'mysql -h {host} -P {port} -u {user} {pass_opt} -e "ALTER SYSTEM SET {var} = {val};"'
+        try:
+            r = subprocess.run(cmd, shell=True, timeout=10, check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode == 0:
+                print(f"  Set {var} = {val}")
+            else:
+                print(f"  Warning: failed to set {var} (exit {r.returncode})")
+        except Exception as e:
+            print(f"  Warning: failed to set {var}: {e}")
+
+
 def ensure_db_running(name: str):
-    """Check if DB is healthy; if not, run its deploy script."""
+    """Check if DB is healthy; deploy locally or via SSH if needed."""
     if is_db_ready(name):
         print(f"  {name} is already running")
         return
@@ -107,12 +217,15 @@ def ensure_db_running(name: str):
         print(f"  Error: deploy script not found: {script_path}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"  {name} not running, deploying via {script}...")
-    r = subprocess.run(
-        ["bash", str(script_path)],
-        timeout=600,
-        check=False,
-    )
+    local = _is_local_db(name)
+    target = "locally" if local else f"on {_ssh_target(name)}"
+    print(f"  {name} not running, deploying {target} via {script}...")
+
+    if local:
+        r = subprocess.run(["bash", str(script_path)], timeout=600, check=False)
+    else:
+        r = _run_remote_script(name, script_path)
+
     if r.returncode != 0:
         print(f"  Error: deploy script failed for {name} (exit {r.returncode})", file=sys.stderr)
         sys.exit(1)
@@ -130,7 +243,10 @@ def stop_db(name: str):
         return
     print(f"  Stopping {name}...")
     try:
-        subprocess.run(cmd, shell=True, timeout=60, check=False)
+        if _is_local_db(name):
+            subprocess.run(cmd, shell=True, timeout=60, check=False)
+        else:
+            _run_remote(name, cmd)
         print(f"  {name} stopped")
     except Exception as e:
         print(f"  Warning: failed to stop {name}: {e}")
@@ -251,7 +367,29 @@ def run_single_db(db_name, dataset_enum, dataset_name, task_label):
     """Ensure DB is deployed, run benchmark, then stop the DB service."""
     rate = INSERT_RATE_OVERRIDES.get((db_name, dataset_name), 500)
     print(f"\n--- Benchmarking {db_name} (insert_rate={rate}) ---")
+
     ensure_db_running(db_name)
+
+    # CohereLarge (10M×768dim) is a memory-intensive dataset. On a 61GB
+    # server the HNSW index alone grows to ~37GB at full scale, so we need
+    # to maximize available memory to avoid OOM:
+    #
+    # 1. THP must be OFF. Transparent Huge Pages cause ~7GB+ untracked
+    #    memory fragmentation (RSS far exceeds actual allocation), which
+    #    wastes precious headroom. With THP off the full 10M dataset
+    #    completes; with THP on it OOMs at ~4M rows.
+    #
+    # 2. System memory parameters are raised to fully utilize the server:
+    #    - memory_limit_percentage=90: use up to 54.9GB (default is lower).
+    #    - ob_vector_memory_limit_percentage=80: allocate 80% of that to
+    #      vector index storage, matching the workload's memory profile.
+    #
+    # Smaller datasets (CohereSmall/Medium) stay well within default
+    # limits and don't need these adjustments.
+    if db_name == "seekdb" and dataset_name == "CohereLarge":
+        check_thp_disabled()
+        seekdb_pre_benchmark()
+
     task = build_task(db_name, dataset_enum, dataset_name)
     label = f"{task_label}_{db_name}"
 
