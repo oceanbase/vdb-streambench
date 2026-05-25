@@ -1,29 +1,52 @@
 #!/bin/bash
 set -euo pipefail
 
-# Milvus 2.6.9 — RPM binary install + systemd
-# Ref: https://milvus.io/docs/zh/install_standalone-binary.md
+# Milvus — Docker/Podman standalone install
+# Supports both binary (if already installed) and container deployment.
 
 MILVUS_VERSION="2.6.9"
-RPM_URL="https://github.com/milvus-io/milvus/releases/download/v${MILVUS_VERSION}/milvus_${MILVUS_VERSION}-1_amd64.rpm"
-RPM_FILE="milvus_${MILVUS_VERSION}-1_amd64.rpm"
+MILVUS_IMAGE="docker.io/milvusdb/milvus:v${MILVUS_VERSION}"
+CONTAINER_NAME="milvus"
+MILVUS_DATA="/opt/milvus/data"
 
 echo "=== Installing Milvus ${MILVUS_VERSION} ==="
 
-if ! command -v milvus &>/dev/null; then
-    echo "Downloading RPM..."
-    wget -q "${RPM_URL}" -O "${RPM_FILE}"
-    yum install -y "./${RPM_FILE}"
-    rm -f "${RPM_FILE}"
+# If binary install already exists, use it
+if command -v milvus &>/dev/null; then
+    echo "Using existing binary install"
+    systemctl enable milvus 2>/dev/null || true
+    systemctl start milvus
+else
+    # Container deployment
+    mkdir -p "${MILVUS_DATA}"
+
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+        echo "Milvus container already running"
+    else
+        docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+
+        echo "Starting Milvus standalone container..."
+        docker run -d \
+            --name "${CONTAINER_NAME}" \
+            --privileged \
+            -p 19530:19530 \
+            -p 9091:9091 \
+            -v "${MILVUS_DATA}:/var/lib/milvus" \
+            -e ETCD_USE_EMBED=true \
+            -e COMMON_STORAGETYPE=local \
+            "${MILVUS_IMAGE}" \
+            milvus run standalone
+    fi
 fi
 
-echo "Starting Milvus..."
-systemctl enable milvus
-systemctl start milvus
-systemctl status milvus --no-pager
+echo "Waiting for startup (may take 1-2 minutes for embedded etcd)..."
+for i in $(seq 1 90); do
+    if curl -sf http://localhost:19530/v1/vector/collections >/dev/null 2>&1; then
+        break
+    fi
+    sleep 5
+done
 
-echo "Verifying..."
-sleep 5
 curl -s http://localhost:19530/v1/vector/collections | head -c 200
 echo
 echo "=== Milvus ${MILVUS_VERSION} ready on port 19530 ==="

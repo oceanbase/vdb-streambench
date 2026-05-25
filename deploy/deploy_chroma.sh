@@ -10,8 +10,18 @@ CHROMA_DATA="/opt/chroma/data"
 CHROMA_LOG="/opt/chroma/chroma.log"
 CHROMA_WRAPPER="/opt/chroma/start_chroma.py"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
+# When run via SSH stdin (bash -s), $0 is "bash" and dirname won't help.
+# Use PROJECT_ROOT env var if set, otherwise try script path, otherwise error.
+if [ -n "${PROJECT_ROOT:-}" ] && [ -d "${PROJECT_ROOT}/.venv" ]; then
+    :
+elif [ -f "$0" ] && [ "$(basename "$0")" != "bash" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
+else
+    echo "Error: PROJECT_ROOT not set and cannot detect from script path" >&2
+    echo "Set PROJECT_ROOT or REMOTE_PROJECT_ROOT in .env" >&2
+    exit 1
+fi
 VENV_PYTHON="${PROJECT_ROOT}/.venv/bin/python"
 
 echo "=== Installing ChromaDB ${CHROMA_VERSION} ==="

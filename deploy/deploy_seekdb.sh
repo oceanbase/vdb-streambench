@@ -5,7 +5,7 @@ set -euo pipefail
 # Ref: https://hub.docker.com/r/oceanbase/seekdb
 
 CONTAINER_NAME="seekdb"
-SEEKDB_DATA="$PWD/seekdb_data"
+SEEKDB_DATA="/opt/seekdb/data"
 
 echo "=== Installing SeekDB (Docker) ==="
 
@@ -21,7 +21,7 @@ else
         -p 2881:2881 \
         -p 2886:2886 \
         -v "${SEEKDB_DATA}:/var/lib/oceanbase" \
-        oceanbase/seekdb
+        docker.io/oceanbase/seekdb
 
     echo "Waiting for SeekDB to initialize (this may take 1-2 minutes)..."
     for i in $(seq 1 60); do

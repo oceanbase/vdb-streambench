@@ -1,88 +1,61 @@
 #!/bin/bash
 set -euo pipefail
 
-# Elasticsearch 9.3.3 — tar install + systemd
-# Ref: https://www.elastic.co/downloads/elasticsearch
+# Elasticsearch — Docker/Podman install
+# Supports both binary (if already installed) and container deployment.
 
 ES_VERSION="9.3.3"
-ES_URL="https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-${ES_VERSION}-linux-x86_64.tar.gz"
+ES_IMAGE="docker.io/elastic/elasticsearch:${ES_VERSION}"
+CONTAINER_NAME="elasticsearch"
 ES_HOME="/opt/elasticsearch"
 
 echo "=== Installing Elasticsearch ${ES_VERSION} ==="
 
-if [ ! -d "${ES_HOME}/bin" ]; then
-    echo "Downloading..."
-    wget -q "${ES_URL}" -O "/tmp/elasticsearch-${ES_VERSION}.tar.gz"
-    mkdir -p "${ES_HOME}"
-    tar -zxf "/tmp/elasticsearch-${ES_VERSION}.tar.gz" -C "${ES_HOME}" --strip-components=1
-    rm -f "/tmp/elasticsearch-${ES_VERSION}.tar.gz"
+# If binary install already exists, use it
+if [ -d "${ES_HOME}/bin" ]; then
+    echo "Using existing binary install at ${ES_HOME}"
+
+    if ! id elasticsearch &>/dev/null; then
+        groupadd -f elasticsearch
+        useradd -g elasticsearch elasticsearch 2>/dev/null || true
+    fi
+    chown -R elasticsearch:elasticsearch "${ES_HOME}"
+
+    grep -q "vm.max_map_count=262144" /etc/sysctl.conf 2>/dev/null || {
+        echo "vm.max_map_count=262144" >> /etc/sysctl.conf
+        sysctl -p 2>/dev/null || true
+    }
+
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable elasticsearch 2>/dev/null || true
+    systemctl start elasticsearch
+else
+    # Container deployment
+    sysctl -w vm.max_map_count=262144 2>/dev/null || true
+
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+        echo "Elasticsearch container already running"
+    else
+        docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+
+        echo "Starting Elasticsearch container..."
+        docker run -d \
+            --name "${CONTAINER_NAME}" \
+            -p 9200:9200 \
+            -e "discovery.type=single-node" \
+            -e "xpack.security.enabled=false" \
+            -e "xpack.security.enrollment.enabled=false" \
+            -e "ES_JAVA_OPTS=-Xms30g -Xmx30g" \
+            "${ES_IMAGE}"
+    fi
 fi
-
-if ! id elasticsearch &>/dev/null; then
-    groupadd -f elasticsearch
-    useradd -g elasticsearch elasticsearch 2>/dev/null || true
-fi
-chown -R elasticsearch:elasticsearch "${ES_HOME}"
-
-mkdir -p "${ES_HOME}/data" "${ES_HOME}/logs"
-
-grep -q "elasticsearch soft nofile" /etc/security/limits.conf 2>/dev/null || {
-    echo "elasticsearch soft nofile 65536" >> /etc/security/limits.conf
-    echo "elasticsearch hard nofile 65536" >> /etc/security/limits.conf
-}
-
-grep -q "vm.max_map_count=262144" /etc/sysctl.conf 2>/dev/null || {
-    echo "vm.max_map_count=262144" >> /etc/sysctl.conf
-    sysctl -p
-}
-
-# ES 9.x auto-generates a security config block (TLS + enrollment) on first
-# start, which overrides a simple sed patch.  Write the full config up front
-# so the auto-generation never kicks in.
-cat > "${ES_HOME}/config/elasticsearch.yml" <<'ESYML'
-xpack.security.enabled: false
-xpack.security.enrollment.enabled: false
-xpack.security.http.ssl.enabled: false
-xpack.security.transport.ssl.enabled: false
-http.host: 0.0.0.0
-discovery.type: single-node
-ESYML
-cat > "${ES_HOME}/config/jvm.options.d/heap.options" <<'JVMEOF'
--Xms30g
--Xmx30g
-JVMEOF
-
-chown -R elasticsearch:elasticsearch "${ES_HOME}"
-
-cat > /etc/systemd/system/elasticsearch.service <<'EOF'
-[Unit]
-Description=Elasticsearch
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-User=elasticsearch
-Group=elasticsearch
-WorkingDirectory=/opt/elasticsearch
-ExecStart=/opt/elasticsearch/bin/elasticsearch
-LimitNOFILE=65536
-LimitMEMLOCK=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-echo "Starting Elasticsearch..."
-systemctl daemon-reload
-systemctl enable elasticsearch
-systemctl start elasticsearch
 
 echo "Waiting for startup..."
-for i in $(seq 1 30); do
-    if curl -s http://localhost:9200 >/dev/null 2>&1; then
+for i in $(seq 1 60); do
+    if curl -sf http://localhost:9200 >/dev/null 2>&1; then
         break
     fi
-    sleep 2
+    sleep 3
 done
 
 curl -s http://localhost:9200

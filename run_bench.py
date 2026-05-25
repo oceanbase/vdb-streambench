@@ -18,6 +18,7 @@ except ImportError:
     pass
 
 from dotenv import load_dotenv
+from pydantic import SecretStr
 from tabulate import tabulate
 
 from vectordb_bench.backend.cases import CaseType
@@ -63,9 +64,9 @@ DEPLOY_SCRIPTS = {
 }
 
 STOP_COMMANDS = {
-    "milvus": "systemctl stop milvus",
-    "elasticsearch": "systemctl stop elasticsearch",
-    "qdrant": "systemctl stop qdrant",
+    "milvus": "systemctl stop milvus 2>/dev/null; docker stop milvus 2>/dev/null; true",
+    "elasticsearch": "systemctl stop elasticsearch 2>/dev/null; docker stop elasticsearch 2>/dev/null; true",
+    "qdrant": "systemctl stop qdrant 2>/dev/null; docker stop qdrant 2>/dev/null; true",
     "chroma": "pkill -f 'start_chroma.py'",
     "seekdb": "docker stop seekdb",
     "lancedb": None,
@@ -103,9 +104,10 @@ def _run_remote(name: str, cmd: str, timeout: int = 60) -> subprocess.CompletedP
 
 
 def _run_remote_script(name: str, script_path: Path, timeout: int = 600) -> subprocess.CompletedProcess:
+    remote_root = os.getenv("REMOTE_PROJECT_ROOT", "/root/vdb-streambench")
     with open(script_path) as f:
         return subprocess.run(
-            ["ssh", _ssh_target(name), "bash -s"],
+            ["ssh", _ssh_target(name), f"PROJECT_ROOT={remote_root} bash -s"],
             stdin=f, timeout=timeout, check=False,
         )
 
@@ -258,7 +260,7 @@ def build_db_config(name: str):
     if name == "milvus":
         return (
             DB.Milvus,
-            MilvusConfig(uri=os.getenv("MILVUS_URI", "http://localhost:19530")),
+            MilvusConfig(uri=SecretStr(os.getenv("MILVUS_URI", "http://localhost:19530"))),
             MilvusHNSWConfig(M=16, efConstruction=256, ef=200),
         )
     if name == "elasticsearch":
@@ -268,21 +270,21 @@ def build_db_config(name: str):
                 host=os.getenv("ES_HOST", "localhost"),
                 port=int(os.getenv("ES_PORT", "9200")),
                 scheme="http",
-                password=os.getenv("ES_PASSWORD", "unused"),
+                password=SecretStr(os.getenv("ES_PASSWORD", "unused")),
             ),
             ElasticCloudIndexConfig(M=16, efConstruction=256, num_candidates=200),
         )
     if name == "qdrant":
         return (
             DB.QdrantLocal,
-            QdrantLocalConfig(url=os.getenv("QDRANT_URL", "http://localhost:6333")),
+            QdrantLocalConfig(url=SecretStr(os.getenv("QDRANT_URL", "http://localhost:6333"))),
             QdrantLocalIndexConfig(m=16, ef_construct=256, hnsw_ef=200),
         )
     if name == "chroma":
         return (
             DB.Chroma,
             ChromaConfig(
-                host=os.getenv("CHROMA_HOST", "localhost"),
+                host=SecretStr(os.getenv("CHROMA_HOST", "localhost")),
                 port=int(os.getenv("CHROMA_PORT", "8000")),
             ),
             ChromaIndexConfig(m=16, ef_construct=256, ef_search=200),
@@ -302,8 +304,8 @@ def build_db_config(name: str):
             SeekDBConfig(
                 host=os.getenv("SEEKDB_HOST", "127.0.0.1"),
                 port=int(os.getenv("SEEKDB_PORT", "2881")),
-                user=os.getenv("SEEKDB_USER", "bench"),
-                password=os.getenv("SEEKDB_PASSWORD", "bench123"),
+                user=SecretStr(os.getenv("SEEKDB_USER", "bench")),
+                password=SecretStr(os.getenv("SEEKDB_PASSWORD", "bench123")),
                 database=os.getenv("SEEKDB_DATABASE", "test"),
             ),
             SeekDBHNSWConfig(m=16, ef_construction=256, ef_search=200),

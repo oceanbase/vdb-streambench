@@ -14,3 +14,6 @@ dependencies = [
     "opentelemetry-proto==1.41.1",
     "opentelemetry-exporter-otlp-proto-grpc==1.41.1",
 ]
+
+[tool.setuptools]
+py-modules = ["run_bench"]
