@@ -4,10 +4,12 @@ set -euo pipefail
 # SeekDB (OceanBase) — Docker install
 # Ref: https://hub.docker.com/r/oceanbase/seekdb
 
+SEEKDB_VERSION="1.3.0.0-100000092026051510"
+SEEKDB_IMAGE="docker.io/oceanbase/seekdb:${SEEKDB_VERSION}"
 CONTAINER_NAME="seekdb"
 SEEKDB_DATA="/opt/seekdb/data"
 
-echo "=== Installing SeekDB (Docker) ==="
+echo "=== Installing SeekDB ${SEEKDB_VERSION} ==="
 
 if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo "SeekDB container already running"
@@ -21,7 +23,7 @@ else
         -p 2881:2881 \
         -p 2886:2886 \
         -v "${SEEKDB_DATA}:/var/lib/oceanbase" \
-        docker.io/oceanbase/seekdb
+        "${SEEKDB_IMAGE}"
 
     echo "Waiting for SeekDB to initialize (this may take 1-2 minutes)..."
     for i in $(seq 1 60); do
